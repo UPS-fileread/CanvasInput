@@ -208,3 +208,5 @@ __marimo__/
 
 # Dataset
 data/
+output/
+.DS_Store
