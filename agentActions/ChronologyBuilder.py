@@ -1,3 +1,6 @@
+"""
+TODO: Cluster topics based on Issue and Person entities.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -69,11 +72,23 @@ ChronologyAction = Annotated[
 
 
 # ---- Dispatcher/registry -----------------------------------------------------
+
+# A handler function processes a specific pipeline action, taking the action model,
+# current state, and optional agent, and returns an updated state dictionary.
 Handler = Callable[[BaseModel, Dict[str, Any], Optional[Any]], Dict[str, Any]]
+
+# Registry mapping action kinds to their handler functions.
+# Used by ChronologyBuilder.run for dynamic dispatch of actions.
 HANDLERS: Dict[str, Handler] = {}
 
 
 def register(kind: str):
+    """
+    Decorator factory to register a function as the handler for a given action kind.
+
+    Inserts the decorated function into the HANDLERS registry under the specified kind.
+    Used by decorating action handler functions to associate them with their action type.
+    """
     def deco(fn: Handler):
         HANDLERS[kind] = fn
         return fn
