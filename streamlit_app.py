@@ -215,12 +215,12 @@ if run:
     num_event_clusters = len(cl.get("event", []) or [])
     num_timeline = len(state.get("timeline", []))
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Docs", num_docs)
-    c2.metric("Events", num_events)
-    c3.metric("Person clusters", num_person_clusters)
-    c4.metric("Event clusters", num_event_clusters)
-    c5.metric("Latency (s)", f"{dt:.2f}")
+    #c2.metric("Events", num_events)
+    c2.metric("Person clusters", num_person_clusters)
+    c3.metric("Event clusters", num_event_clusters)
+    c4.metric("Latency (s)", f"{dt:.2f}")
 
     # ---------------------------
     # Tabs: person/event clusters, timeline, raw
