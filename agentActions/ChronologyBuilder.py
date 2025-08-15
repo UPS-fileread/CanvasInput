@@ -277,6 +277,20 @@ class GPTAgent:
         Default uses incremental tagging ("event-incremental"). If algorithm == "gpt-topics",
         it falls back to the batch LLM path and extracts event labels only.
         """
+        # -------------------------------------------------------------------------
+        # EVENTS CLUSTERING METHOD
+        # Groups extracted events into thematic categories based on similarity.
+        # Each event is represented by its 'what' summary. The method processes
+        # events one by one, attempting to assign each to an existing tag if it fits
+        # (LLM can decide via incremental tagging) or creating a new tag otherwise.
+        # This incremental strategy ensures consistent labeling across documents
+        # while still allowing new topics to emerge. Supports two main modes:
+        #   - "event-incremental" (default): step-by-step assignment using GPT to
+        #     reuse existing tags or generate new ones.
+        #   - "gpt-topics": batch assignment via GPT for all events at once.
+        # Output: a list of event clusters, each containing a tag/topic, and the
+        #         list of events assigned to it.
+        # -------------------------------------------------------------------------
         if not events:
             return []
 
