@@ -1,1 +1,0 @@
-1. Does the "Actions" defined on the Linear are necessary to output? Do we need pydantic? 
