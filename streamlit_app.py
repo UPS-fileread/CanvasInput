@@ -1,5 +1,9 @@
 import streamlit as st
-import io
+import os
+import json
+import time
+from typing import List, Dict, Any
+
 
 def extract_pdf_text(BytesIO) -> str:
     """Extract plain text from a PDF file-like object. Returns concatenated page texts.
@@ -26,7 +30,7 @@ def extract_pdf_text(BytesIO) -> str:
         st.error(f"Failed to read PDF: {e}")
         raise
 
-uploaded_files = st.file_uploader("...or upload one or more .txt / .jsonl / .pdf files", type=["txt", "jsonl", "pdf"], accept_multiple_files=True) 
+uploaded_files = st.file_uploader("upload one or more .txt / .pdf (OCR) files", type=["txt", "jsonl", "pdf"], accept_multiple_files=True) 
 
 if uploaded_files:
     combined_payloads = []
@@ -56,21 +60,10 @@ if uploaded_files:
     # Join with double newline to separate docs from different files
     st.session_state["corpus_input"] = "\n\n".join(combined_payloads)
 
-st.text_area(
-    "Paste documents (blank-line separated), JSONL (one {text} per line), or upload a PDF on the left",
-    # ... rest of the parameters remain unchanged
-)
-
-import os
-import json
-import time
-from typing import List, Dict, Any
-
-import streamlit as st
 
 # Import the builder from your package
 try:
-    from agentActions.ChronologyBuilder import ChronologyBuilder
+    from agentActions.ChronologyBuilder import ChronologyBuilder, MineDocsAction, ExtractEventsAction, ClusterTopicsAction, ProposeTimelineAction
 except Exception as e:
     st.error("Failed to import ChronologyBuilder. Make sure your PYTHONPATH includes the project root and the module path is correct (agentActions/ChronologyBuilder.py).\n\nError: %s" % e)
     st.stop()
@@ -158,13 +151,19 @@ def show_cluster_view(view_name: str, clusters: List[Dict[str, Any]]):
 # -------------------------------
 with st.sidebar:
     st.title("Chronology Builder")
-    st.caption("LLM-only clustering — returns both views: by person and by event.")
+    st.caption("LLM-only clustering — returns both views: by person and by event. Upload OCR'd PDFs or text files.")
 
     if not os.getenv("OPENAI_API_KEY"):
         st.warning("OPENAI_API_KEY is not set in the environment. Set it before running to enable extraction/clustering.")
 
     st.markdown("**Input options**")
-    demo = st.toggle("Load example corpus", value=True)
+    st.markdown("**Example corpus**")
+    import os  # ensure os is available in this scope
+    EXAMPLE_CORPUS_DRIVE_URL = os.getenv("EXAMPLE_CORPUS_DRIVE_URL", "")
+    if EXAMPLE_CORPUS_DRIVE_URL:
+        st.link_button("Open example corpus on Drive (PS: There are a few repeated docs for testing purpose.)", EXAMPLE_CORPUS_DRIVE_URL)
+    else:
+        st.info("Set the EXAMPLE_CORPUS_DRIVE_URL environment variable to a Google Drive link to show an example corpus here.")
 
     st.markdown("---")
     st.markdown("**Run options**")
@@ -173,23 +172,6 @@ with st.sidebar:
 # -------------------------------
 # Main area: Input
 # -------------------------------
-if demo:
-    default_text = """
-Bill Gates announced a new vaccine initiative in Seattle on 2023-05-12.
-
-Elon Musk unveiled the new Tesla Roadster at the California event on 2023-02-10.
-
-Satya Nadella presented Microsoft's AI strategy during the annual conference in 2023-09-01.
-    """.strip()
-else:
-    default_text = ""
-
-st.text_area(
-    "Paste documents (plain text separated by blank lines, or JSONL with a `text` field per line)",
-    value=default_text,
-    height=240,
-    key="corpus_input",
-)
 
 run = st.button("🚀 Build Chronology", type="primary")
 
@@ -203,12 +185,20 @@ if run:
         st.stop()
 
     st.write(f"**Docs:** {len(docs)}")
-    if uploaded is not None and (uploaded.type == "application/pdf" or uploaded.name.lower().endswith(".pdf")):
-        st.caption("Each uploaded PDF is treated as a single document (pages are concatenated). To create multiple docs, add blank lines between sections in the text box.")
+    if uploaded_files:
+        st.caption("Processing uploaded files…")
 
     try:
         t0 = time.time()
-        builder = ChronologyBuilder(corpus=docs)  # default 4-step pipeline
+        builder = ChronologyBuilder(
+            corpus=docs,
+            actions=[
+                MineDocsAction(kind="mine_docs"),
+                ExtractEventsAction(kind="extract_events"),
+                ClusterTopicsAction(kind="cluster_topics", algorithm="auto"),
+                ProposeTimelineAction(kind="propose_timeline"),
+            ],
+        )
         state = builder.run()
         dt = time.time() - t0
     except Exception as e:

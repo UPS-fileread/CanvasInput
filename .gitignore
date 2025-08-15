@@ -210,3 +210,5 @@ __marimo__/
 data/
 output/
 .DS_Store
+
+questions.txt

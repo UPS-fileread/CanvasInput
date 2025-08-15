@@ -51,7 +51,7 @@ class ExtractEventsAction(BaseModel):
 
 class ClusterTopicsAction(BaseModel):
     kind: Literal["cluster_topics"]
-    algorithm: Literal["auto", "gpt-topics", "kmeans", "agglomerative", "lda"] = Field(
+    algorithm: Literal["auto", "gpt-topics", "event-incremental"] = Field(
         default="auto", description="Clustering strategy; default uses GPT to assign concise topics."
     )
     k: Optional[int] = Field(default=None, ge=1, description="Optional fixed k for clustering (unused for GPT).")
@@ -167,6 +167,12 @@ class TopicAssignments(BaseModel):
 class TopicList(BaseModel):
     topics: List[str]
 
+# For incremental event tagging decisions
+class TagDecision(BaseModel):
+    # Exactly one of these should be non-null
+    use_tag: Optional[str] = None   # Must match an existing tag exactly (case-insensitive)
+    new_tag: Optional[str] = None   # Provide a concise 2–4 word tag when no existing tag fits
+
 
 class GPTAgent:
     """Agent that uses OpenAI to extract events and assign concise topic labels."""
@@ -247,17 +253,123 @@ class GPTAgent:
             {"role": "user", "content": user},
         ]
 
-    def cluster(self, events: List[Dict[str, Any]]):
-        """LLM-only clustering. Returns both views: clusters by person and clusters by event.
-        If multiple people are mentioned in a summary, the event is added to *each* person's cluster.
-        Output shape:
-        {
-          "person": [{"topic": <person or \"anyone\">, "person": <str|None>, "event": None, "events": [...]}, ...],
-          "event":  [{"topic": <event or \"general\">, "person": None, "event": <str|None>, "events": [...]}, ...]
-        }
+    def _build_incremental_messages(self, summary: str, existing_tags: List[str]) -> List[Dict[str, str]]:
+        system = (
+            "You are an event tagger. Given an event summary and a list of existing event tags, either: "
+            "(a) pick ONE of the existing tags that best fits, returning it exactly, or (b) propose a NEW concise 2–4 word tag. "
+            "Return ONLY JSON matching {\"use_tag\": string|null, \"new_tag\": string|null}. "
+            "If you choose an existing tag, it must be returned EXACTLY as provided (case-insensitive match acceptable). "
+            "Prefer reuse over creating new tags unless none fit. Make tags short and general, avoid punctuation."
+        )
+        tag_list = "\n".join(f"- {t}" for t in existing_tags) if existing_tags else "(none)"
+        user = (
+            "Existing tags:\n" + tag_list + "\n\n" +
+            "Event summary:\n" + summary + "\n\n" +
+            "Respond with JSON only."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def cluster_events(self, events: List[Dict[str, Any]], algorithm: str = "event-incremental") -> List[Dict[str, Any]]:
+        """Return event-centric clusters only.
+        Default uses incremental tagging ("event-incremental"). If algorithm == "gpt-topics",
+        it falls back to the batch LLM path and extracts event labels only.
         """
         if not events:
-            return {"person": [], "event": []}
+            return []
+
+        def _norm_str(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = re.sub(r"\s+", " ", str(x)).strip()
+            return s if s else None
+
+        if algorithm == "gpt-topics":
+            summaries = [str(e.get("what") or "") for e in events]
+            try:
+                completion = self.client.chat.completions.parse(
+                    model=self.model,
+                    messages=self._build_topic_messages(summaries),
+                    response_format=TopicAssignments,
+                )
+                assigns: List[TopicAssignment] = completion.choices[0].message.parsed.clusters
+                if len(assigns) != len(events):
+                    raise ValueError("Assignment count mismatch")
+            except Exception:
+                return [{"topic": "general", "person": None, "event": None, "events": events}]
+
+            by_event: Dict[Optional[str], List[Dict[str, Any]]] = {}
+            for e, a in zip(events, assigns):
+                ev = _norm_str(a.event)
+                by_event.setdefault(ev, []).append(e)
+
+            out: List[Dict[str, Any]] = []
+            for ev, evs in by_event.items():
+                out.append({"topic": ev or "general", "person": None, "event": ev, "events": evs})
+            return out
+
+        # Default incremental path (event-incremental)
+        existing_tags: List[str] = []
+        by_event: Dict[str, List[Dict[str, Any]]] = {}
+        for e in events:
+            summary = str(e.get("what") or "")
+            try:
+                completion = self.client.chat.completions.parse(
+                    model=self.model,
+                    messages=self._build_incremental_messages(summary, existing_tags),
+                    response_format=TagDecision,
+                )
+                decision: TagDecision = completion.choices[0].message.parsed
+                use_tag = _norm_str(decision.use_tag)
+                new_tag = _norm_str(decision.new_tag)
+            except Exception:
+                words = [w for w in re.split(r"\W+", summary.lower()) if w]
+                new_tag = " ".join(words[:3]) or "general"
+                use_tag = None
+
+            if use_tag:
+                match = None
+                for t in existing_tags:
+                    if t.lower() == use_tag.lower():
+                        match = t
+                        break
+                tag = match or use_tag
+                if tag not in existing_tags:
+                    existing_tags.append(tag)
+            else:
+                tag = new_tag or "general"
+                if tag not in existing_tags:
+                    existing_tags.append(tag)
+
+            by_event.setdefault(tag, []).append(e)
+
+        event_clusters: List[Dict[str, Any]] = []
+        for ev, evs in by_event.items():
+            event_clusters.append({"topic": ev, "person": None, "event": ev, "events": evs})
+        return event_clusters
+
+    def cluster_persons(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return person-centric clusters using the batch gpt-topics path only."""
+        if not events:
+            return []
+
+        def _norm_str(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = re.sub(r"\s+", " ", str(x)).strip()
+            return s if s else None
+
+        def _norm_list(xs: Optional[List[str]]) -> List[str]:
+            out: List[str] = []
+            if not xs:
+                return out
+            for x in xs:
+                nx = _norm_str(x)
+                if nx and nx.lower() not in [o.lower() for o in out]:
+                    out.append(nx)
+            return out
 
         summaries = [str(e.get("what") or "") for e in events]
         try:
@@ -270,78 +382,132 @@ class GPTAgent:
             if len(assigns) != len(events):
                 raise ValueError("Assignment count mismatch")
         except Exception:
-            return {
-                "person": [{"topic": "anyone", "person": None, "event": None, "events": events}],
-                "event":  [{"topic": "general", "person": None, "event": None, "events": events}],
-            }
-
-        def _norm_str(x: Optional[str]) -> Optional[str]:
-            if x is None:
-                return None
-            s = re.sub(r"\s+", " ", str(x)).strip().lower()
-            return s or None
-
-        def _norm_list(xs: Optional[List[str]]) -> List[str]:
-            out: List[str] = []
-            if not xs:
-                return out
-            for x in xs:
-                nx = _norm_str(x)
-                if nx and nx not in out:
-                    out.append(nx)
-            return out
+            return [{"topic": "anyone", "person": None, "event": None, "events": events}]
 
         by_person: Dict[Optional[str], List[Dict[str, Any]]] = {}
-        by_event: Dict[Optional[str], List[Dict[str, Any]]] = {}
-
         for e, a in zip(events, assigns):
-            # Prefer array if present, else back-compat single string
             persons = _norm_list(a.persons) or ([] if a.person is None else [_norm_str(a.person)])
-            event_label = _norm_str(a.event)
-
-            # Fan-out: add the event under every mentioned person; if none, bucket under None (anyone)
             if persons:
                 for p in persons:
                     by_person.setdefault(p, []).append(e)
             else:
                 by_person.setdefault(None, []).append(e)
 
-            # Event view: standard single label bucketing (None -> "general")
-            by_event.setdefault(event_label, []).append(e)
-
-        person_clusters: List[Dict[str, Any]] = []
+        out: List[Dict[str, Any]] = []
         for p, evs in by_person.items():
-            person_clusters.append({
-                "topic": p or "anyone",
-                "person": p,
-                "event": None,
-                "events": evs,
-            })
+            out.append({"topic": p or "anyone", "person": p, "event": None, "events": evs})
+        return out
 
-        event_clusters: List[Dict[str, Any]] = []
-        for ev, evs in by_event.items():
-            event_clusters.append({
-                "topic": ev or "general",
-                "person": None,
-                "event": ev,
-                "events": evs,
-            })
+    def cluster(self, events: List[Dict[str, Any]], algorithm: str = "auto"):
+        if not events:
+            return {"person": [], "event": []}
 
-        return {"person": person_clusters, "event": event_clusters}
+        # Orchestration rules (supported algorithms):
+        # - "gpt-topics": one LLM pass to get both views
+        # - "event-incremental": incremental tags for event view only
+        # - "auto" (default): person view via gpt-topics; event view via incremental
+        if algorithm == "gpt-topics":
+            summaries = [str(e.get("what") or "") for e in events]
+            try:
+                completion = self.client.chat.completions.parse(
+                    model=self.model,
+                    messages=self._build_topic_messages(summaries),
+                    response_format=TopicAssignments,
+                )
+                assigns: List[TopicAssignment] = completion.choices[0].message.parsed.clusters
+                if len(assigns) != len(events):
+                    raise ValueError("Assignment count mismatch")
+            except Exception:
+                return {
+                    "person": [{"topic": "anyone", "person": None, "event": None, "events": events}],
+                    "event":  [{"topic": "general", "person": None, "event": None, "events": events}],
+                }
+
+            def _norm_str(x: Optional[str]) -> Optional[str]:
+                if x is None:
+                    return None
+                s = re.sub(r"\s+", " ", str(x)).strip()
+                return s if s else None
+
+            def _norm_list(xs: Optional[List[str]]) -> List[str]:
+                out: List[str] = []
+                if not xs:
+                    return out
+                for x in xs:
+                    nx = _norm_str(x)
+                    if nx and nx.lower() not in [o.lower() for o in out]:
+                        out.append(nx)
+                return out
+
+            by_person: Dict[Optional[str], List[Dict[str, Any]]] = {}
+            by_event: Dict[Optional[str], List[Dict[str, Any]]] = {}
+            for e, a in zip(events, assigns):
+                persons = _norm_list(a.persons) or ([] if a.person is None else [_norm_str(a.person)])
+                ev = _norm_str(a.event)
+                if persons:
+                    for p in persons:
+                        by_person.setdefault(p, []).append(e)
+                else:
+                    by_person.setdefault(None, []).append(e)
+                by_event.setdefault(ev, []).append(e)
+
+            person_clusters: List[Dict[str, Any]] = []
+            for p, evs in by_person.items():
+                person_clusters.append({"topic": p or "anyone", "person": p, "event": None, "events": evs})
+            event_clusters: List[Dict[str, Any]] = []
+            for ev, evs in by_event.items():
+                event_clusters.append({"topic": ev or "general", "person": None, "event": ev, "events": evs})
+            return {"person": person_clusters, "event": event_clusters}
+
+        if algorithm == "event-incremental":
+            return {"person": [], "event": self.cluster_events(events, "event-incremental")}
+
+        # auto
+        return {
+            "person": self.cluster_persons(events),
+            "event": self.cluster_events(events, "event-incremental"),
+        }
 
     # ---- Timeline -----------------------------------------------------------
     def propose_timeline(
         self, clusters: List[Dict[str, Any]] | Dict[str, List[Dict[str, Any]]], granularity: str, include_sources: bool
     ) -> List[Dict[str, Any]]:
-        # Accept list of clusters OR dict with keys {"person": [...], "event": [...]}.
+        # Accept list of clusters OR dict with keys {"person": [...], "event": [...]}. De-duplicate events across views.
         if isinstance(clusters, dict):
             all_clusters: List[Dict[str, Any]] = []
             for v in clusters.values():
                 all_clusters.extend(v or [])
         else:
             all_clusters = clusters or []
-        events = [e for c in all_clusters for e in c.get("events", [])]
+
+        # Flatten with de-duplication
+        events: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        def _event_key(e: Dict[str, Any]):
+            # Prefer unique source index if present; else fall back to a tuple of identifying fields
+            src = e.get("source")
+            if src is not None:
+                return ("source", src)
+            return (
+                "fields",
+                str(e.get("who") or "").strip(),
+                str(e.get("what") or "").strip(),
+                str(e.get("when") or "").strip(),
+                str(e.get("where") or "").strip(),
+            )
+
+        for c in all_clusters:
+            for e in c.get("events", []):
+                k = _event_key(e)
+                if k in seen:
+                    continue
+                seen.add(k)
+                events.append(e)
+
+        # Sort by parsed date
         events.sort(key=lambda e: _parse_date_for_sort(e.get("when")))
+
         if not include_sources:
             for e in events:
                 e.pop("source", None)
@@ -404,7 +570,7 @@ def _cluster_topics(
 ) -> Dict[str, Any]:
     events = state.get("events", [])
     if agent and hasattr(agent, "cluster"):
-        clusters = agent.cluster(events)  # returns {"person": [...], "event": [...]}
+        clusters = agent.cluster(events, a.algorithm)  # returns {"person": [...], "event": []}
     else:
         clusters = {"person": [{"topic": "anyone", "person": None, "event": None, "events": events}],
                     "event":  [{"topic": "general", "person": None, "event": None, "events": events}]}
@@ -421,8 +587,37 @@ def _propose_timeline(
         timeline = agent.propose_timeline(clusters, a.granularity, a.include_sources)
         return {**state, "timeline": timeline}
 
-    # Fallback: flatten cluster events and sort by parsed date from the 'when' field
-    events = [e for c in clusters for e in c.get("events", [])]
+    # Fallback: flatten cluster events (dict or list) with de-dup and sort by date
+    if isinstance(clusters, dict):
+        all_clusters = []
+        for v in clusters.values():
+            all_clusters.extend(v or [])
+    else:
+        all_clusters = clusters or []
+
+    events: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _event_key(e: Dict[str, Any]):
+        src = e.get("source")
+        if src is not None:
+            return ("source", src)
+        return (
+            "fields",
+            str(e.get("who") or "").strip(),
+            str(e.get("what") or "").strip(),
+            str(e.get("when") or "").strip(),
+            str(e.get("where") or "").strip(),
+        )
+
+    for c in all_clusters:
+        for e in c.get("events", []):
+            k = _event_key(e)
+            if k in seen:
+                continue
+            seen.add(k)
+            events.append(e)
+
     events.sort(key=lambda e: _parse_date_for_sort(e.get("when")))
     if not a.include_sources:
         for e in events:
