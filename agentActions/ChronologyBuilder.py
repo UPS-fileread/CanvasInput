@@ -1,5 +1,7 @@
 """
-TODO: Cluster topics based on Issue and Person entities.
+LLM-only clustering: extract {person, event} for each event, and return both views.
+state["clusters"] = {"person": [...], "event": [...]}.
+Multi-assign: if a summary mentions multiple people, its event is added to each person's cluster.
 """
 from __future__ import annotations
 
@@ -151,6 +153,17 @@ class Event(BaseModel):
     where: Optional[str] = None
 
 
+# ---- LLM Clustering output models ----
+class TopicAssignment(BaseModel):
+    # Back-compat: either a single person or a list of persons can be provided by the LLM
+    person: Optional[str] = None
+    persons: Optional[List[str]] = None
+    event: Optional[str] = None
+
+class TopicAssignments(BaseModel):
+    clusters: List[TopicAssignment]
+
+
 class TopicList(BaseModel):
     topics: List[str]
 
@@ -211,48 +224,123 @@ class GPTAgent:
     # ---- Clustering ---------------------------------------------------------
     def _build_topic_messages(self, summaries: List[str]) -> List[Dict[str, str]]:
         system = (
-            "You assign concise topic labels to events. Given a list of event summaries, "
-            "return a short 2–4 word topic label for each item. Be consistent across similar items. "
-            "Only output JSON with a 'topics' array of strings, same length as the input."
+            "You assign cluster labels by identifying PEOPLE and an EVENT for each item.\n"
+            "For every input summary, extract:\n"
+            "  - persons: array of distinct person names mentioned ([] if none)\n"
+            "  - event: a concise 2–4 word event label (string) or null if none is clear\n"
+            "Return ONLY JSON with a 'clusters' array of objects matching the input length."
         )
         numbered = "\n".join(f"{idx+1}. {s}" for idx, s in enumerate(summaries))
-        user = f"Event summaries:\n\n{numbered}\n\nRespond with:\n{{\n  \"topics\": [\"topic for 1\", \"topic for 2\", ...]\n}}"
+        user = (
+            "Event summaries:\n\n"
+            f"{numbered}\n\n"
+            "Respond with JSON exactly like:\n"
+            "{\n"
+            "  \"clusters\": [\n"
+            "    {\"persons\": [\"Alice\", \"Bob\"], \"event\": \"product launch\"},\n"
+            "    {\"persons\": [], \"event\": null}\n"
+            "  ]\n"
+            "}"
+        )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
 
-    def cluster(self, events: List[Dict[str, Any]], algorithm: str, k: Optional[int]):
-        # Use GPT topic labels regardless of algorithm (fallback to single cluster on error)
+    def cluster(self, events: List[Dict[str, Any]]):
+        """LLM-only clustering. Returns both views: clusters by person and clusters by event.
+        If multiple people are mentioned in a summary, the event is added to *each* person's cluster.
+        Output shape:
+        {
+          "person": [{"topic": <person or \"anyone\">, "person": <str|None>, "event": None, "events": [...]}, ...],
+          "event":  [{"topic": <event or \"general\">, "person": None, "event": <str|None>, "events": [...]}, ...]
+        }
+        """
         if not events:
-            return []
+            return {"person": [], "event": []}
+
         summaries = [str(e.get("what") or "") for e in events]
         try:
             completion = self.client.chat.completions.parse(
                 model=self.model,
                 messages=self._build_topic_messages(summaries),
-                response_format=TopicList,
+                response_format=TopicAssignments,
             )
-            topics = completion.choices[0].message.parsed.topics
-            if len(topics) != len(events):
-                raise ValueError("Topic count mismatch")
+            assigns: List[TopicAssignment] = completion.choices[0].message.parsed.clusters
+            if len(assigns) != len(events):
+                raise ValueError("Assignment count mismatch")
         except Exception:
-            # Single-cluster fallback
-            return [{"topic": "all", "events": events}]
+            return {
+                "person": [{"topic": "anyone", "person": None, "event": None, "events": events}],
+                "event":  [{"topic": "general", "person": None, "event": None, "events": events}],
+            }
 
-        # Group by topic label
-        buckets: Dict[str, List[Dict[str, Any]]] = {}
-        for e, t in zip(events, topics):
-            label = (t or "misc").strip() or "misc"
-            buckets.setdefault(label, []).append(e)
-        clusters = [{"topic": topic, "events": evs} for topic, evs in buckets.items()]
-        return clusters
+        def _norm_str(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = re.sub(r"\s+", " ", str(x)).strip().lower()
+            return s or None
+
+        def _norm_list(xs: Optional[List[str]]) -> List[str]:
+            out: List[str] = []
+            if not xs:
+                return out
+            for x in xs:
+                nx = _norm_str(x)
+                if nx and nx not in out:
+                    out.append(nx)
+            return out
+
+        by_person: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        by_event: Dict[Optional[str], List[Dict[str, Any]]] = {}
+
+        for e, a in zip(events, assigns):
+            # Prefer array if present, else back-compat single string
+            persons = _norm_list(a.persons) or ([] if a.person is None else [_norm_str(a.person)])
+            event_label = _norm_str(a.event)
+
+            # Fan-out: add the event under every mentioned person; if none, bucket under None (anyone)
+            if persons:
+                for p in persons:
+                    by_person.setdefault(p, []).append(e)
+            else:
+                by_person.setdefault(None, []).append(e)
+
+            # Event view: standard single label bucketing (None -> "general")
+            by_event.setdefault(event_label, []).append(e)
+
+        person_clusters: List[Dict[str, Any]] = []
+        for p, evs in by_person.items():
+            person_clusters.append({
+                "topic": p or "anyone",
+                "person": p,
+                "event": None,
+                "events": evs,
+            })
+
+        event_clusters: List[Dict[str, Any]] = []
+        for ev, evs in by_event.items():
+            event_clusters.append({
+                "topic": ev or "general",
+                "person": None,
+                "event": ev,
+                "events": evs,
+            })
+
+        return {"person": person_clusters, "event": event_clusters}
 
     # ---- Timeline -----------------------------------------------------------
     def propose_timeline(
-        self, clusters: List[Dict[str, Any]], granularity: str, include_sources: bool
+        self, clusters: List[Dict[str, Any]] | Dict[str, List[Dict[str, Any]]], granularity: str, include_sources: bool
     ) -> List[Dict[str, Any]]:
-        events = [e for c in clusters for e in c.get("events", [])]
+        # Accept list of clusters OR dict with keys {"person": [...], "event": [...]}.
+        if isinstance(clusters, dict):
+            all_clusters: List[Dict[str, Any]] = []
+            for v in clusters.values():
+                all_clusters.extend(v or [])
+        else:
+            all_clusters = clusters or []
+        events = [e for c in all_clusters for e in c.get("events", [])]
         events.sort(key=lambda e: _parse_date_for_sort(e.get("when")))
         if not include_sources:
             for e in events:
@@ -316,9 +404,10 @@ def _cluster_topics(
 ) -> Dict[str, Any]:
     events = state.get("events", [])
     if agent and hasattr(agent, "cluster"):
-        clusters = agent.cluster(events, a.algorithm, a.k)
+        clusters = agent.cluster(events)  # returns {"person": [...], "event": [...]}
     else:
-        clusters = [{"topic": "auto", "events": events}]
+        clusters = {"person": [{"topic": "anyone", "person": None, "event": None, "events": events}],
+                    "event":  [{"topic": "general", "person": None, "event": None, "events": events}]}
     return {**state, "clusters": clusters}
 
 
@@ -356,8 +445,10 @@ class ChronologyBuilder(BaseModel):
     Provide an *agent* implementing optional hooks:
       - search(query, docs)
       - extract_events(docs, fields)
-      - cluster(events, algorithm, k)
+      - cluster(events)                  # returns {"person": [...], "event": [...]}
       - propose_timeline(clusters, granularity, include_sources)
+
+    state["clusters"] is a dict with keys "person" and "event", each a list of clusters.
 
     If no agent is supplied, GPTAgent is used.
     """

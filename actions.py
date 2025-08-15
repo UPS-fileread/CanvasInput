@@ -2,6 +2,8 @@
 TODO: Move to Langfuse.
 
 based on the actions each classes has, decide which class to use.
+
+I want to pull/define every actions in here(from main.py) for the cleaner version.
 """
 from pydantic import BaseModel, Field, model_validator
 from typing import Annotated, Union, Literal, Callable, Dict, Any
